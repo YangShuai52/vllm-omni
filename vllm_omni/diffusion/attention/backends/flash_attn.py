@@ -526,10 +526,67 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
 
+        from vllm_omni.platforms.npu._310p import is_310p
+
+        if is_310p():
+            return self.forward_fa_310p(query, key, value, attn_metadata)
+
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
         if kv_cache_dtype is not None:
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
+
+    def forward_fa_310p(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """310P attention using torch_npu._npu_flash_attention_unpad.
+
+        310P does not support FIA (npu_fusion_attention) used by the
+        mindiesd path. This method uses _npu_flash_attention_unpad for
+        packed varlen sequences (the H3 main path) and falls back to
+        segment-wise SDPA for other cases.
+        """
+        import torch_npu
+
+        extra = attn_metadata.extra if attn_metadata else {}
+        cu_seqlens = extra.get("cu_seqlens_q")
+
+        if cu_seqlens is not None and query.shape[0] == 1:
+            q = query.squeeze(0)  # [1, T, N, D] -> [T, N, D]
+            k = key.squeeze(0)
+            v = value.squeeze(0)
+            seq_lens_cpu = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().to(torch.int32)
+            out = torch.empty_like(q)
+            torch_npu._npu_flash_attention_unpad(
+                query=q,
+                key=k,
+                value=v,
+                seq_len=seq_lens_cpu,
+                scale_value=self.softmax_scale,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                out=out,
+            )
+            return out.unsqueeze(0)
+
+        # Non-packed or multi-batch fallback: segment-wise SDPA
+        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
+        query_perm, key_perm, value_perm = (x.permute(0, 2, 1, 3) for x in (query, key, value))
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query_perm,
+            key_perm,
+            value_perm,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=self.causal,
+            scale=self.softmax_scale,
+        )
+        return out.permute(0, 2, 1, 3)
 
     def forward_fa_quant_npu(
         self,
