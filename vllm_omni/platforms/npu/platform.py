@@ -263,13 +263,26 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                 # that snapshot; otherwise aclnnLaserAttention /
                 # FusedAttentionScore fail with EZ1001 "does not support
                 # opType" for the rest of the process.
-                import mindiesd  # noqa: F401
+                # 310P does not support FIA (npu_fusion_attention) which is
+                # the underlying kernel of mindiesd attention ops, so skip
+                # the mindiesd import on 310P to avoid device-check failures.
+                from vllm_omni.platforms.npu._310p import is_310p
+
+                if not is_310p():
+                    import mindiesd  # noqa: F401
 
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         # Try FLASH_ATTN if mindiesd is available, otherwise fall back to SDPA
+        # 310P does not support FIA (npu_fusion_attention), so always use SDPA.
+        from vllm_omni.platforms.npu._310p import is_310p
+
+        if is_310p():
+            logger.debug("310P detected: defaulting to diffusion attention backend SDPA")
+            return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
+
         if find_spec("mindiesd"):
             # Configure ASCEND_CUSTOM_OPP_PATH for mindiesd custom ops upon import
             import mindiesd  # noqa: F401
@@ -286,6 +299,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         from importlib.util import find_spec
 
+        from vllm_omni.platforms.npu._310p import is_310p
+
+        if is_310p():
+            return False
         return find_spec("mindiesd") is not None
 
     @classmethod
