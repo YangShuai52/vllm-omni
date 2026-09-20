@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.logger import init_logger
+from vllm_ascend.device.device_config import is_310p
 
 from vllm_omni.platforms.npu.layers.rotary_embedding import (
     npu_rotary_mul_with_bsnd_fallback,
@@ -70,13 +71,22 @@ def _scaled_dot_product_attention_npu(
             "GQA requires query heads to be a multiple of KV heads, "
             f"got q_heads={num_heads} and kv_heads={num_key_value_heads}."
         )
+    enable_gqa = num_heads != num_key_value_heads
+    if is_310p() and enable_gqa:
+        # 310P does not support native SDPA GQA.  Expanding K/V also avoids
+        # torch-npu trying an in-place format cast on transposed tensors.
+        repeat_num = num_heads // num_key_value_heads
+        key = key.repeat_interleave(repeat_num, dim=1)
+        value = value.repeat_interleave(repeat_num, dim=1)
+        enable_gqa = False
+
     return F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
         dropout_p=0.0,
         is_causal=True,
-        enable_gqa=num_heads != num_key_value_heads,
+        enable_gqa=enable_gqa,
     )
 
 
