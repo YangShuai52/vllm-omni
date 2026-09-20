@@ -11,7 +11,9 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.logger import init_logger
+from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
 from vllm_ascend.device.device_config import is_310p
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, nd_to_nz_2d
 
 from vllm_omni.platforms.npu.layers.rotary_embedding import (
     npu_rotary_mul_with_bsnd_fallback,
@@ -22,6 +24,56 @@ logger = init_logger(__name__)
 _ROPE_PATCHED = False
 _SDPA_PATCHED = False
 _SWIGLU_PATCHED = False
+_CAUSAL_MASK_310P: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _causal_mask_310p(device: torch.device, sequence_length: int) -> torch.Tensor:
+    key = (device, sequence_length)
+    mask = _CAUSAL_MASK_310P.get(key)
+    if mask is None:
+        mask = AttentionMaskBuilder310.gen_causal_additive_mask(sequence_length, device)
+        mask = torch_npu.npu_format_cast(nd_to_nz_2d(mask), ACL_FORMAT_FRACTAL_NZ)
+        _CAUSAL_MASK_310P[key] = mask
+    return mask
+
+
+def _scaled_dot_product_attention_310p(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Run causal self-attention through 310P native flash attention."""
+    batch_size, num_heads, sequence_length, head_dim = query.shape
+    num_key_value_heads = key.shape[1]
+    real_tokens = batch_size * sequence_length
+
+    query_flat = aligned_16(query.transpose(1, 2).reshape(real_tokens, num_heads, head_dim))
+    key_flat = aligned_16(key.transpose(1, 2).reshape(real_tokens, num_key_value_heads, head_dim))
+    value_flat = aligned_16(value.transpose(1, 2).reshape(real_tokens, num_key_value_heads, head_dim))
+    aligned_tokens = int(query_flat.shape[0])
+
+    sequence_lengths = torch.full((batch_size,), sequence_length, dtype=torch.int32, device="cpu")
+    if aligned_tokens > real_tokens:
+        sequence_lengths[-1] += aligned_tokens - real_tokens
+    mask_length = int(sequence_lengths.max().item())
+    mask = _causal_mask_310p(query.device, mask_length)
+    output = torch.empty(
+        (aligned_tokens, num_heads, head_dim),
+        dtype=torch.float16,
+        device=query.device,
+    )
+    torch_npu._npu_flash_attention(
+        query=query_flat.contiguous(),
+        key=key_flat.contiguous(),
+        value=value_flat.contiguous(),
+        mask=mask,
+        seq_len=sequence_lengths,
+        scale_value=head_dim**-0.5,
+        num_heads=num_heads,
+        num_kv_heads=num_key_value_heads,
+        out=output,
+    )
+    return output[:real_tokens].reshape(batch_size, sequence_length, num_heads, head_dim).transpose(1, 2)
 
 
 def _apply_rotary_pos_emb_npu(
@@ -71,14 +123,8 @@ def _scaled_dot_product_attention_npu(
             "GQA requires query heads to be a multiple of KV heads, "
             f"got q_heads={num_heads} and kv_heads={num_key_value_heads}."
         )
-    enable_gqa = num_heads != num_key_value_heads
-    if is_310p() and enable_gqa:
-        # 310P does not support native SDPA GQA.  Expanding K/V also avoids
-        # torch-npu trying an in-place format cast on transposed tensors.
-        repeat_num = num_heads // num_key_value_heads
-        key = key.repeat_interleave(repeat_num, dim=1)
-        value = value.repeat_interleave(repeat_num, dim=1)
-        enable_gqa = False
+    if is_310p():
+        return _scaled_dot_product_attention_310p(query, key, value)
 
     return F.scaled_dot_product_attention(
         query.contiguous(),
@@ -86,7 +132,7 @@ def _scaled_dot_product_attention_npu(
         value.contiguous(),
         dropout_p=0.0,
         is_causal=True,
-        enable_gqa=enable_gqa,
+        enable_gqa=num_heads != num_key_value_heads,
     )
 
 

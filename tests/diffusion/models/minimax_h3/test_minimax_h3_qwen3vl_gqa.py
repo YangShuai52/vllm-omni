@@ -81,29 +81,25 @@ def test_minimax_h3_npu_sdpa_preserves_compressed_heads_and_selects_gqa(
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
-def test_minimax_h3_310p_sdpa_expands_gqa_and_uses_contiguous_inputs(monkeypatch) -> None:
+def test_minimax_h3_310p_sdpa_uses_native_flash_attention(monkeypatch) -> None:
     from vllm_omni.platforms.npu.models import minimax_h3 as npu_minimax_h3
 
-    captured: dict[str, object] = {}
+    captured: dict[str, torch.Tensor] = {}
 
-    def fake_sdpa(query, key, value, **kwargs):
-        captured.update(query=query, key=key, value=value, kwargs=kwargs)
+    def fake_310p(query, key, value):
+        captured.update(query=query, key=key, value=value)
         return query
 
     monkeypatch.setattr(npu_minimax_h3, "is_310p", lambda: True)
-    monkeypatch.setattr(F, "scaled_dot_product_attention", fake_sdpa)
-    query = torch.randn(1, 4, 3, 8).transpose(-1, -2).transpose(-1, -2)
-    key = torch.randn(1, 2, 3, 8).transpose(-1, -2).transpose(-1, -2)
+    monkeypatch.setattr(npu_minimax_h3, "_scaled_dot_product_attention_310p", fake_310p)
+    query = torch.randn(1, 4, 3, 8)
+    key = torch.randn(1, 2, 3, 8)
     value = torch.randn_like(key)
 
-    npu_minimax_h3._scaled_dot_product_attention_npu(query, key, value)
+    output = npu_minimax_h3._scaled_dot_product_attention_npu(query, key, value)
 
-    assert captured["query"].is_contiguous()
-    assert captured["key"].is_contiguous()
-    assert captured["value"].is_contiguous()
-    assert captured["key"].shape[1] == 4
-    assert captured["value"].shape[1] == 4
-    assert captured["kwargs"]["enable_gqa"] is False
+    assert captured == {"query": query, "key": key, "value": value}
+    assert output is query
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
