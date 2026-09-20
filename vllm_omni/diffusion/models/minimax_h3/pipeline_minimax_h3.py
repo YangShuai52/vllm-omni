@@ -1007,6 +1007,7 @@ class MiniMaxH3Pipeline(
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                dtype=od_config.dtype,
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
@@ -1374,7 +1375,7 @@ class MiniMaxH3Pipeline(
 
         hidden = _broadcast_tensor(
             hidden,
-            dtype=torch.bfloat16,
+            dtype=self.od_config.dtype,
             device=self.device,
         )
         tags = _broadcast_tensor(
@@ -1446,8 +1447,8 @@ class MiniMaxH3Pipeline(
         """
         keys = ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
         key_dtypes = {
-            "pixel_values": torch.bfloat16,
-            "pixel_values_videos": torch.bfloat16,
+            "pixel_values": self.od_config.dtype,
+            "pixel_values_videos": self.od_config.dtype,
             "image_grid_thw": torch.long,
             "video_grid_thw": torch.long,
         }
@@ -2320,7 +2321,7 @@ class MiniMaxH3Pipeline(
             if text_conditioning is not None:
                 text_embeddings = text_conditioning.hidden_states.to(
                     device=self.device,
-                    dtype=torch.bfloat16,
+                    dtype=self.od_config.dtype,
                 )
                 text_tags = text_conditioning.token_tags.to(
                     device=self.device,

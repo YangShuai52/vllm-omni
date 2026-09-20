@@ -27,6 +27,14 @@ def _encoder_without_weights() -> MiniMaxH3Qwen3VLEncoder:
     return encoder
 
 
+def test_encoder_stub_records_requested_dtype() -> None:
+    encoder = MiniMaxH3Qwen3VLEncoder(
+        "unused", device=torch.device("cpu"), load_model=False, dtype=torch.float16
+    )
+
+    assert encoder.dtype is torch.float16
+
+
 @pytest.mark.parametrize("initial_state", [False, True])
 def test_encode_ids_restores_cudnn_sdp_after_success(monkeypatch: pytest.MonkeyPatch, initial_state: bool) -> None:
     encoder = _encoder_without_weights()

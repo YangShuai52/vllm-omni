@@ -122,7 +122,9 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         masked_input[input_mask] = 0
         output = F.embedding(masked_input, self.weight)
         output[input_mask, :] = 0.0
+        output = output.float()
         self.group.all_reduce(output)
+        output = output.to(self.weight.dtype)
         return output
 
     def weight_loader(
@@ -1101,11 +1103,13 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         load_model: bool,
         encoder_group: Any | None = None,
         quant_config: QuantizationConfig | None = None,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         self.device_target = device
         self.encoder_group = encoder_group
         self.quant_config = quant_config
+        self.dtype = dtype
         _validate_encoder_quant_config(quant_config)
         self.image_token_id = 151655
         self.video_token_id = 151656
@@ -1119,7 +1123,6 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
-        dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         self.vision.to(dtype=dtype)
         self.text_model = MiniMaxH3Qwen3VLTextModel(
@@ -1348,7 +1351,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
 
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.vision(
-                pixel_values.to(device, torch.bfloat16),
+                pixel_values.to(device, self.dtype),
                 image_grid_thw.to(device, torch.long),
             )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1356,7 +1359,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
         if pixel_values_videos is not None:
             video_embeds, deepstack_video_embeds = self.vision(
-                pixel_values_videos.to(device, torch.bfloat16),
+                pixel_values_videos.to(device, self.dtype),
                 video_grid_thw.to(device, torch.long),
             )
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1387,7 +1390,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         expected = (int(ids.shape[1]), MINIMAX_H3_QWEN3VL_HIDDEN_DIM)
         if tuple(hidden.shape) != expected:
             raise ValueError(f"unexpected Qwen3-VL hidden shape {tuple(hidden.shape)}, expected {expected}")
-        return hidden.to(torch.bfloat16)
+        return hidden.to(self.dtype)
 
     def _get_placeholder_mask(
         self,
