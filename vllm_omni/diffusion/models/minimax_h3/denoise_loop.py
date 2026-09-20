@@ -95,6 +95,18 @@ class MiniMaxH3DenoiseBranch:
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
         self.audio_update_mask_dev = self.audio_update_mask.to(device)
+        # 310P cannot reliably execute boolean indexing because it lowers to
+        # NonZero + IndexPutV2.  Materialize full-row masks on CPU once, then
+        # use elementwise ``where`` on device in every denoise step.
+        img_condition_rows = torch.zeros(seq_len, dtype=torch.bool)
+        img_condition_rows[self.img_pos[~self.update_mask]] = True
+        audio_update_rows = torch.zeros(seq_len, dtype=torch.bool)
+        audio_update_rows[self.audio_pos[self.audio_update_mask]] = True
+        audio_condition_rows = torch.zeros(seq_len, dtype=torch.bool)
+        audio_condition_rows[self.audio_pos[~self.audio_update_mask]] = True
+        self.img_condition_rows_dev = img_condition_rows.to(device)
+        self.audio_update_rows_dev = audio_update_rows.to(device)
+        self.audio_condition_rows_dev = audio_condition_rows.to(device)
         self.x_base = torch.zeros(1, seq_len, MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
@@ -184,10 +196,21 @@ class MiniMaxH3DenoiseBranch:
             dtype=torch.float32,
             device=x.device,
         )
-        timesteps[self.img_pos_dev[self.update_mask_dev]] = t_video
-        timesteps[self.img_pos_dev[~self.update_mask_dev]] = imgvid_cond_timestep
-        timesteps[self.audio_pos_dev[self.audio_update_mask_dev]] = t_audio
-        timesteps[self.audio_pos_dev[~self.audio_update_mask_dev]] = audio_ref_cond_timestep
+        timesteps = torch.where(
+            self.img_condition_rows_dev,
+            torch.full_like(timesteps, float(imgvid_cond_timestep)),
+            timesteps,
+        )
+        timesteps = torch.where(
+            self.audio_update_rows_dev,
+            torch.full_like(timesteps, float(t_audio)),
+            timesteps,
+        )
+        timesteps = torch.where(
+            self.audio_condition_rows_dev,
+            torch.full_like(timesteps, float(audio_ref_cond_timestep)),
+            timesteps,
+        )
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,

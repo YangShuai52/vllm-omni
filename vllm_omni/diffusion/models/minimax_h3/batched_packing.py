@@ -88,11 +88,28 @@ def minimax_h3_batched_forward_kwargs(
         position_id_parts.append(branch.img_position_ids_dev)
         text_embed_parts.append(branch.text_embeddings_dev)
 
-        timesteps[seq_offset : seq_offset + branch.seq_len] = float(t_video[index])
-        timesteps[img_pos[branch.update_mask_dev]] = float(t_video[index])
-        timesteps[img_pos[~branch.update_mask_dev]] = float(imgvid_cond_timesteps[index])
-        timesteps[audio_pos[branch.audio_update_mask_dev]] = float(t_audio[index])
-        timesteps[audio_pos[~branch.audio_update_mask_dev]] = float(audio_ref_cond_timesteps[index])
+        branch_timesteps = torch.full(
+            (branch.seq_len,),
+            float(t_video[index]),
+            dtype=torch.float32,
+            device=device,
+        )
+        branch_timesteps = torch.where(
+            branch.img_condition_rows_dev,
+            torch.full_like(branch_timesteps, float(imgvid_cond_timesteps[index])),
+            branch_timesteps,
+        )
+        branch_timesteps = torch.where(
+            branch.audio_update_rows_dev,
+            torch.full_like(branch_timesteps, float(t_audio[index])),
+            branch_timesteps,
+        )
+        branch_timesteps = torch.where(
+            branch.audio_condition_rows_dev,
+            torch.full_like(branch_timesteps, float(audio_ref_cond_timesteps[index])),
+            branch_timesteps,
+        )
+        timesteps[seq_offset : seq_offset + branch.seq_len].copy_(branch_timesteps)
 
         # Empty documents are omitted because not every varlen kernel accepts
         # repeated interior boundaries.
