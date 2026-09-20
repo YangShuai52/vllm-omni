@@ -89,18 +89,33 @@ def _install_310p_vae_attention_patch(decoder: nn.Module, device: torch.device) 
         return False
 
     patched = False
+    module_names: set[str] = set()
     for block in getattr(decoder, "transformer_blocks", ()):
         attention = getattr(block, "attn", None)
+        attention_module = getattr(type(attention), "__module__", "")
+        if attention_module:
+            module_names.add(attention_module.rsplit(".", 1)[0] + ".flash")
         perform_attention = getattr(attention, "perform_attention", None)
-        namespace = getattr(perform_attention, "__globals__", None)
-        flash_attn = namespace.get("flash_attn") if isinstance(namespace, dict) else None
-        flash_namespace = getattr(flash_attn, "__globals__", None)
-        if isinstance(flash_namespace, dict) and "_sdpa_attention" in flash_namespace:
-            flash_namespace["_sdpa_attention"] = _vae_sdpa_attention_310p
+        private_attention = getattr(attention, "_perform_attention", None)
+        for method in (perform_attention, private_attention):
+            namespace = getattr(method, "__globals__", None)
+            flash_attn = namespace.get("flash_attn") if isinstance(namespace, dict) else None
+            flash_namespace = getattr(flash_attn, "__globals__", None)
+            if isinstance(flash_namespace, dict) and "_sdpa_attention" in flash_namespace:
+                flash_namespace["_sdpa_attention"] = _vae_sdpa_attention_310p
+                patched = True
+
+    for module_name in module_names:
+        try:
+            flash_module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(flash_module, "_sdpa_attention"):
+            flash_module._sdpa_attention = _vae_sdpa_attention_310p
             patched = True
     if not patched:
-        raise RuntimeError("MiniMax-H3 VAE 310P could not locate remote _sdpa_attention")
-    return True
+        logger.warning("MiniMax-H3 VAE 310P could not locate remote _sdpa_attention; leaving decoder unchanged")
+    return patched
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
