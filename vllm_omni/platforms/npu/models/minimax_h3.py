@@ -136,6 +136,32 @@ def _scaled_dot_product_attention_npu(
     )
 
 
+def _scaled_dot_product_attention_vision_npu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    if not is_310p():
+        return F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+    batch_size, num_heads, sequence_length, head_dim = query.shape
+    q = query.transpose(1, 2).reshape(-1, num_heads, head_dim).to(torch.float16).contiguous()
+    k = key.transpose(1, 2).reshape(-1, key.shape[1], head_dim).to(torch.float16).contiguous()
+    v = value.transpose(1, 2).reshape(-1, value.shape[1], head_dim).to(torch.float16).contiguous()
+    output = torch.empty_like(q)
+    sequence_lengths = torch.full((batch_size,), sequence_length, dtype=torch.int32, device="cpu")
+    torch_npu._npu_flash_attention_unpad(
+        query=q,
+        key=k,
+        value=v,
+        seq_len=sequence_lengths,
+        scale_value=head_dim**-0.5,
+        num_heads=num_heads,
+        num_kv_heads=key.shape[1],
+        out=output,
+    )
+    return output.reshape(batch_size, sequence_length, num_heads, head_dim).transpose(1, 2).to(query.dtype)
+
+
 def apply_minimax_h3_qwen3vl_sdpa_patch() -> None:
     """Route MiniMax H3 Qwen3-VL text attention to NPU native GQA."""
     global _SDPA_PATCHED
@@ -145,6 +171,7 @@ def apply_minimax_h3_qwen3vl_sdpa_patch() -> None:
     from vllm_omni.diffusion.models.minimax_h3 import encoder
 
     encoder._scaled_dot_product_attention = _scaled_dot_product_attention_npu
+    encoder._scaled_dot_product_attention_vision = _scaled_dot_product_attention_vision_npu
     _SDPA_PATCHED = True
     logger.debug("Applied NPU SDPA patch for MiniMax H3 Qwen3-VL text encoder")
 

@@ -423,6 +423,14 @@ def _scaled_dot_product_attention(
     )
 
 
+def _scaled_dot_product_attention_vision(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    return F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+
+
 def _apply_interleaved_mrope(freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Reorganize chunked [TTT...HHH...WWW] into interleaved [THWTHW...] layout."""
     freqs_t = freqs[0]
@@ -578,9 +586,7 @@ class MiniMaxH3Qwen3VLVisionAttention(nn.Module):
 
         lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
-        attn_outputs = [
-            F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False) for q, k, v in zip(*splits)
-        ]
+        attn_outputs = [_scaled_dot_product_attention_vision(q, k, v) for q, k, v in zip(*splits)]
         attn_output = torch.cat(attn_outputs, dim=2)
         # The SDPA kernel may return a non-contiguous (1, num_heads, seq_len, head_dim)
         # tensor whose memory layout is seq-major; transpose before flattening exactly

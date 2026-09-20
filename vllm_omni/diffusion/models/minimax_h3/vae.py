@@ -38,6 +38,71 @@ MINIMAX_H3_AUDIO_CHANNELS = 2
 logger = init_logger(__name__)
 
 
+def _vae_sdpa_attention_310p(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool = False,
+) -> torch.Tensor:
+    """310P replacement for the remote VAE's unsupported PyTorch SDPA."""
+    if causal:
+        raise NotImplementedError("MiniMax-H3 VAE 310P attention does not support causal mode")
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("MiniMax-H3 VAE 310P attention expects [B, S, H, D] tensors")
+
+    import torch_npu
+
+    batch_size, sequence_length, num_heads, head_dim = query.shape
+    num_key_value_heads = key.shape[2]
+    output_dtype = query.dtype
+    q = query.reshape(-1, num_heads, head_dim).to(torch.float16).contiguous()
+    k = key.reshape(-1, num_key_value_heads, head_dim).to(torch.float16).contiguous()
+    v = value.reshape(-1, num_key_value_heads, head_dim).to(torch.float16).contiguous()
+    output = torch.empty_like(q)
+    sequence_lengths = torch.full(
+        (batch_size,),
+        sequence_length,
+        dtype=torch.int32,
+        device="cpu",
+    )
+    torch_npu._npu_flash_attention_unpad(
+        query=q,
+        key=k,
+        value=v,
+        seq_len=sequence_lengths,
+        scale_value=head_dim**-0.5,
+        num_heads=num_heads,
+        num_kv_heads=num_key_value_heads,
+        out=output,
+    )
+    return output.reshape(batch_size, sequence_length, num_heads, head_dim).to(output_dtype)
+
+
+def _install_310p_vae_attention_patch(decoder: nn.Module, device: torch.device) -> bool:
+    if device.type != "npu":
+        return False
+    try:
+        from vllm_ascend.device.device_config import is_310p
+    except ImportError:
+        return False
+    if not is_310p():
+        return False
+
+    patched = False
+    for block in getattr(decoder, "transformer_blocks", ()):
+        attention = getattr(block, "attn", None)
+        perform_attention = getattr(attention, "perform_attention", None)
+        namespace = getattr(perform_attention, "__globals__", None)
+        flash_attn = namespace.get("flash_attn") if isinstance(namespace, dict) else None
+        flash_namespace = getattr(flash_attn, "__globals__", None)
+        if isinstance(flash_namespace, dict) and "_sdpa_attention" in flash_namespace:
+            flash_namespace["_sdpa_attention"] = _vae_sdpa_attention_310p
+            patched = True
+    if not patched:
+        raise RuntimeError("MiniMax-H3 VAE 310P could not locate remote _sdpa_attention")
+    return True
+
+
 def _load_component_config(component_path: str) -> dict[str, Any]:
     config_path = Path(component_path) / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -137,6 +202,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         decoder = getattr(self.remote.model, "decoder", None)
         if decoder is not None:
+            _install_310p_vae_attention_patch(decoder, device)
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
