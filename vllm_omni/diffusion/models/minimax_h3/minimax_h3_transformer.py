@@ -116,7 +116,24 @@ class MiniMaxH3DiTArchConfig:
 
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
-_BF16_DTYPE = torch.bfloat16
+
+
+def _minimax_h3_compute_dtype() -> torch.dtype:
+    """Select fp16 on 310P, whose compute and HCCL paths reject bf16."""
+    if current_omni_platform.is_npu():
+        try:
+            from vllm_ascend.device.device_config import is_310p
+
+            if is_310p():
+                return torch.float16
+        except ImportError:
+            pass
+    return torch.bfloat16
+
+
+# Kept as the historical internal name to avoid a broad checkpoint-facing
+# refactor.  On 310P it resolves to fp16 before modules are constructed.
+_BF16_DTYPE = _minimax_h3_compute_dtype()
 _FP32_DTYPE = torch.float32
 
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(

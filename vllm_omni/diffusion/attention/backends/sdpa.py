@@ -168,4 +168,32 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        from vllm_omni.platforms.npu._310p import is_310p
+
+        if is_310p():
+            import torch_npu
+
+            extra = attn_metadata.extra if attn_metadata else {}
+            cu_seqlens = extra.get("cu_seqlens_q")
+            if cu_seqlens is None or query.shape[0] != 1:
+                raise NotImplementedError(
+                    "310P TORCH_SDPA requires packed single-batch cu_seqlens; "
+                    "native scaled_dot_product_attention is unsupported"
+                )
+            q = query.squeeze(0).contiguous()
+            k = key.squeeze(0).contiguous()
+            v = value.squeeze(0).contiguous()
+            seq_lens_cpu = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().to(torch.int32)
+            out = torch.empty_like(q)
+            torch_npu._npu_flash_attention_unpad(
+                query=q,
+                key=k,
+                value=v,
+                seq_len=seq_lens_cpu,
+                scale_value=self.softmax_scale,
+                num_heads=q.shape[1],
+                num_kv_heads=k.shape[1],
+                out=out,
+            )
+            return out.unsqueeze(0)
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")
